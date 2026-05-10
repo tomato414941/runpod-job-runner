@@ -43,3 +43,7 @@ The runner deletes the created pod after success or failure unless
 Use `--dry-run` before paid jobs to print the pod payload, sync plan, remote
 commands, output copy commands, and cleanup command without requiring a RunPod
 API key or creating a pod.
+
+Use repeatable `--local` commands for local preflight checks. Local commands
+run before any pod is created; if one fails, the job stops without starting paid
+compute. In `--dry-run` mode, local commands are printed but not executed.

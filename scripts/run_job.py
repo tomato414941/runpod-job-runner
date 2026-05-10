@@ -350,6 +350,12 @@ def split_remote(command: str) -> str:
     return command
 
 
+def local_shell_command(command: str) -> list[str]:
+    if not command.strip():
+        raise ValueError("local command must not be empty")
+    return ["bash", "-lc", command]
+
+
 def timestamped_name(prefix: str) -> str:
     return f"{prefix}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
 
@@ -393,6 +399,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--keep-pod", action="store_true")
     parser.add_argument("--keep-pod-on-failure", action="store_true")
+    parser.add_argument("--local", action="append", default=[])
     parser.add_argument("--sync", action="append", default=[])
     parser.add_argument("--setup-command", required=True)
     parser.add_argument("--remote", action="append", default=[])
@@ -420,6 +427,10 @@ def print_dry_run_plan(args: argparse.Namespace, secrets: list[str], public_key:
     print("sync sources:")
     for source in sync_sources(args):
         print(f"- {source}")
+    if args.local:
+        print("local preflight commands:")
+        for command in args.local:
+            dry_run(local_shell_command(command), secrets=secrets)
     print("commands:")
     dry_run([args.runpodctl, "pod", "list", "-o", "json"], secrets=secrets)
     dry_run(["curl", "--request", "POST", "--url", "https://rest.runpod.io/v1/pods", "--data", json.dumps(pod_payload(args, public_key), separators=(",", ":"))], secrets=secrets)
@@ -462,6 +473,13 @@ def main() -> int:
     args = parse_args()
     args.repo_root = args.repo_root.resolve()
     args.pod_name = args.pod_name or timestamped_name(args.name)
+    if args.dry_run and args.ssh_key is None:
+        args.ssh_key = Path("dry-run-ssh-key")
+    if args.dry_run and args.ssh_public_key is None:
+        args.ssh_public_key = Path("dry-run-ssh-key.pub")
+    if not args.dry_run:
+        for command in args.local:
+            run(local_shell_command(command), cwd=args.repo_root, secrets=[])
     if not args.dry_run and shutil.which(args.runpodctl) is None:
         raise FileNotFoundError(f"runpodctl command not found: {args.runpodctl}")
     if shutil.which("rsync") is None:
@@ -470,10 +488,6 @@ def main() -> int:
         raise FileNotFoundError("ssh command not found")
     if shutil.which("curl") is None:
         raise FileNotFoundError("curl command not found")
-    if args.dry_run and args.ssh_key is None:
-        args.ssh_key = Path("dry-run-ssh-key")
-    if args.dry_run and args.ssh_public_key is None:
-        args.ssh_public_key = Path("dry-run-ssh-key.pub")
     if args.ssh_key is None:
         raise ValueError("set RUNPOD_SSH_KEY or pass --ssh-key")
     if args.ssh_public_key is None:
