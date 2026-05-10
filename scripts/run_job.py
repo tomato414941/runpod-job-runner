@@ -29,6 +29,56 @@ class Connection:
     user: str = "root"
 
 
+class TimingRecorder:
+    def __init__(self, output_path: Path | None, *, pod_name: str, dry_run: bool) -> None:
+        self.output_path = output_path
+        self.data: dict[str, object] = {
+            "pod_name": pod_name,
+            "dry_run": dry_run,
+            "status": "running",
+            "started_at": utc_timestamp(),
+            "finished_at": None,
+            "total_seconds": None,
+            "pod_id": None,
+            "steps": [],
+        }
+        self._started = time.monotonic()
+
+    def set_pod_id(self, pod_id: str) -> None:
+        self.data["pod_id"] = pod_id
+
+    def step(self, name: str, callback):
+        started_at = utc_timestamp()
+        started = time.monotonic()
+        record: dict[str, object] = {"name": name, "started_at": started_at}
+        try:
+            result = callback()
+            record["status"] = "passed"
+            return result
+        except Exception:
+            record["status"] = "failed"
+            raise
+        finally:
+            record["finished_at"] = utc_timestamp()
+            record["duration_seconds"] = round(time.monotonic() - started, 3)
+            steps = self.data["steps"]
+            assert isinstance(steps, list)
+            steps.append(record)
+
+    def finish(self, status: str) -> None:
+        self.data["status"] = status
+        self.data["finished_at"] = utc_timestamp()
+        self.data["total_seconds"] = round(time.monotonic() - self._started, 3)
+        if self.output_path is None:
+            return
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.output_path.write_text(json.dumps(self.data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def quote(value: str | Path) -> str:
     return shlex.quote(str(value))
 
@@ -397,6 +447,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-runtime-minutes", type=int, default=420)
     parser.add_argument("--allow-existing-pods", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--timings-output", type=Path)
     parser.add_argument("--keep-pod", action="store_true")
     parser.add_argument("--keep-pod-on-failure", action="store_true")
     parser.add_argument("--local", action="append", default=[])
@@ -473,86 +524,110 @@ def main() -> int:
     args = parse_args()
     args.repo_root = args.repo_root.resolve()
     args.pod_name = args.pod_name or timestamped_name(args.name)
-    if args.dry_run and args.ssh_key is None:
-        args.ssh_key = Path("dry-run-ssh-key")
-    if args.dry_run and args.ssh_public_key is None:
-        args.ssh_public_key = Path("dry-run-ssh-key.pub")
-    if not args.dry_run:
-        for command in args.local:
-            run(local_shell_command(command), cwd=args.repo_root, secrets=[])
-    if not args.dry_run and shutil.which(args.runpodctl) is None:
-        raise FileNotFoundError(f"runpodctl command not found: {args.runpodctl}")
-    if shutil.which("rsync") is None:
-        raise FileNotFoundError("rsync command not found")
-    if shutil.which("ssh") is None:
-        raise FileNotFoundError("ssh command not found")
-    if shutil.which("curl") is None:
-        raise FileNotFoundError("curl command not found")
-    if args.ssh_key is None:
-        raise ValueError("set RUNPOD_SSH_KEY or pass --ssh-key")
-    if args.ssh_public_key is None:
-        raise ValueError("set RUNPOD_SSH_PUBLIC_KEY or pass --ssh-public-key")
-    if not args.dry_run and not args.ssh_key.exists():
-        raise FileNotFoundError(args.ssh_key)
-    if not args.dry_run and not args.ssh_public_key.exists():
-        raise FileNotFoundError(args.ssh_public_key)
-
-    api_key = os.environ.get("RUNPOD_API_KEY", "")
-    if not api_key and not args.dry_run:
-        if args.secret_path is None:
-            raise ValueError("set RUNPOD_API_KEY, set RUNPOD_API_KEY_FILE, or pass --secret-path")
-        api_key = load_text(args.secret_path)
-    public_key = load_text(args.ssh_public_key) if args.ssh_public_key.exists() else ""
-    secrets = [api_key, public_key]
-    if args.dry_run:
-        if not sync_sources(args):
-            raise RuntimeError("no sync sources found")
-        print_dry_run_plan(args, secrets, public_key)
-        return 0
+    timings = TimingRecorder(args.timings_output, pod_name=args.pod_name, dry_run=args.dry_run)
+    status = "failed"
     pod_id: str | None = None
     success = False
     try:
+        if args.dry_run and args.ssh_key is None:
+            args.ssh_key = Path("dry-run-ssh-key")
+        if args.dry_run and args.ssh_public_key is None:
+            args.ssh_public_key = Path("dry-run-ssh-key.pub")
+        if not args.dry_run:
+            for index, command in enumerate(args.local, start=1):
+                timings.step(
+                    f"local_preflight_{index}",
+                    lambda command=command: run(local_shell_command(command), cwd=args.repo_root, secrets=[]),
+                )
+        if not args.dry_run and shutil.which(args.runpodctl) is None:
+            raise FileNotFoundError(f"runpodctl command not found: {args.runpodctl}")
+        if shutil.which("rsync") is None:
+            raise FileNotFoundError("rsync command not found")
+        if shutil.which("ssh") is None:
+            raise FileNotFoundError("ssh command not found")
+        if shutil.which("curl") is None:
+            raise FileNotFoundError("curl command not found")
+        if args.ssh_key is None:
+            raise ValueError("set RUNPOD_SSH_KEY or pass --ssh-key")
+        if args.ssh_public_key is None:
+            raise ValueError("set RUNPOD_SSH_PUBLIC_KEY or pass --ssh-public-key")
+        if not args.dry_run and not args.ssh_key.exists():
+            raise FileNotFoundError(args.ssh_key)
+        if not args.dry_run and not args.ssh_public_key.exists():
+            raise FileNotFoundError(args.ssh_public_key)
+
+        api_key = os.environ.get("RUNPOD_API_KEY", "")
+        if not api_key and not args.dry_run:
+            if args.secret_path is None:
+                raise ValueError("set RUNPOD_API_KEY, set RUNPOD_API_KEY_FILE, or pass --secret-path")
+            api_key = load_text(args.secret_path)
+        public_key = load_text(args.ssh_public_key) if args.ssh_public_key.exists() else ""
+        secrets = [api_key, public_key]
+        if args.dry_run:
+            if not sync_sources(args):
+                raise RuntimeError("no sync sources found")
+            print_dry_run_plan(args, secrets, public_key)
+            status = "dry-run"
+            return 0
         if not args.allow_existing_pods:
-            pods = active_pods(args, secrets)
+            pods = timings.step("active_pods_check", lambda: active_pods(args, secrets))
             if pods:
                 names = ", ".join(f"{pod['name']}:{pod['id']}" for pod in pods)
                 raise RuntimeError(f"RunPod account already has active pods: {names}")
-        before = list_pods(args, secrets)
-        create_pod(args, secrets, api_key, public_key)
-        after = list_pods(args, secrets)
+        before = timings.step("pod_list_before", lambda: list_pods(args, secrets))
+        timings.step("pod_create", lambda: create_pod(args, secrets, api_key, public_key))
+        after = timings.step("pod_list_after", lambda: list_pods(args, secrets))
         pod = find_created(before, after, args.pod_name)
         pod_id = pod["id"]
+        timings.set_pod_id(pod_id)
         print(f"created pod: {pod_id}")
-        connection = wait_for_connection(args, pod_id, secrets)
+        connection = timings.step("ssh_info_wait", lambda: wait_for_connection(args, pod_id, secrets))
         print(f"ssh: {connection.user}@{connection.host}:{connection.port}")
-        wait_for_ssh(args, connection, secrets)
-        run(
-            ssh(
-                args,
-                connection,
-                "set -euo pipefail; if ! command -v rsync >/dev/null 2>&1; then apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y rsync; fi",
-            ),
-            cwd=args.repo_root,
-            secrets=secrets,
-        )
-        run(ssh(args, connection, f"mkdir -p {quote(args.remote_dir)}"), cwd=args.repo_root, secrets=secrets)
-        rsync_to_remote(args, connection, secrets)
-        run(ssh(args, connection, remote_dir_command(args, args.setup_command)), cwd=args.repo_root, secrets=secrets)
-        deadline = time.monotonic() + args.max_runtime_minutes * 60 if args.max_runtime_minutes > 0 else None
-        for command in args.remote:
-            timeout = None if deadline is None else max(1, deadline - time.monotonic())
-            run(
-                ssh(args, connection, remote_dir_command(args, split_remote(command))),
+        timings.step("ssh_ready_wait", lambda: wait_for_ssh(args, connection, secrets))
+        timings.step(
+            "transport_setup",
+            lambda: run(
+                ssh(
+                    args,
+                    connection,
+                    "set -euo pipefail; if ! command -v rsync >/dev/null 2>&1; then apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y rsync; fi",
+                ),
                 cwd=args.repo_root,
                 secrets=secrets,
-                timeout=timeout,
+            ),
+        )
+        timings.step(
+            "remote_mkdir",
+            lambda: run(ssh(args, connection, f"mkdir -p {quote(args.remote_dir)}"), cwd=args.repo_root, secrets=secrets),
+        )
+        timings.step("repo_sync", lambda: rsync_to_remote(args, connection, secrets))
+        timings.step(
+            "setup",
+            lambda: run(ssh(args, connection, remote_dir_command(args, args.setup_command)), cwd=args.repo_root, secrets=secrets),
+        )
+        deadline = time.monotonic() + args.max_runtime_minutes * 60 if args.max_runtime_minutes > 0 else None
+        for index, command in enumerate(args.remote, start=1):
+            timeout = None if deadline is None else max(1, deadline - time.monotonic())
+            timings.step(
+                f"remote_{index}",
+                lambda command=command, timeout=timeout: run(
+                    ssh(args, connection, remote_dir_command(args, split_remote(command))),
+                    cwd=args.repo_root,
+                    secrets=secrets,
+                    timeout=timeout,
+                ),
             )
-        rsync_from_remote(args, connection, secrets)
+        timings.step("output_sync", lambda: rsync_from_remote(args, connection, secrets))
         success = True
+        status = "passed"
         return 0
     finally:
         if pod_id and not args.keep_pod and (success or not args.keep_pod_on_failure):
-            run([args.runpodctl, "pod", "delete", pod_id], cwd=args.repo_root, secrets=[], check=False)
+            timings.step(
+                "pod_delete",
+                lambda: run([args.runpodctl, "pod", "delete", pod_id], cwd=args.repo_root, secrets=[], check=False),
+            )
+        timings.finish(status)
 
 
 if __name__ == "__main__":

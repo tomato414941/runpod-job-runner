@@ -47,3 +47,7 @@ API key or creating a pod.
 Use repeatable `--local` commands for local preflight checks. Local commands
 run before any pod is created; if one fails, the job stops without starting paid
 compute. In `--dry-run` mode, local commands are printed but not executed.
+
+Use `--timings-output path/to/timings.json` to write job step timings for later
+inspection. The timings file records step names, timestamps, durations, and
+status without storing command text or secrets.
