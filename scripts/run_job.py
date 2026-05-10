@@ -523,6 +523,8 @@ def print_dry_run_plan(args: argparse.Namespace, secrets: list[str], public_key:
 def main() -> int:
     args = parse_args()
     args.repo_root = args.repo_root.resolve()
+    if args.timings_output is not None and not args.timings_output.is_absolute():
+        args.timings_output = args.repo_root / args.timings_output
     args.pod_name = args.pod_name or timestamped_name(args.name)
     timings = TimingRecorder(args.timings_output, pod_name=args.pod_name, dry_run=args.dry_run)
     status = "failed"
