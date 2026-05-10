@@ -75,6 +75,10 @@ def run(
     return completed
 
 
+def dry_run(command: list[str], *, secrets: list[str]) -> None:
+    print(f"$ {redact(command_text(command), secrets)}")
+
+
 def parse_json(text: str) -> object:
     stripped = text.strip()
     if not stripped:
@@ -141,7 +145,7 @@ def active_pods(args: argparse.Namespace, secrets: list[str]) -> list[dict[str, 
     return [pod for pod in list_pods(args, secrets) if pod["status"].upper() not in inactive]
 
 
-def create_pod(args: argparse.Namespace, secrets: list[str], api_key: str, public_key: str) -> None:
+def pod_payload(args: argparse.Namespace, public_key: str) -> dict[str, object]:
     payload: dict[str, object] = {
         "name": args.pod_name,
         "gpuTypeIds": [args.gpu_type],
@@ -166,6 +170,11 @@ def create_pod(args: argparse.Namespace, secrets: list[str], api_key: str, publi
         payload["env"] = {"PUBLIC_KEY": public_key}
     if not args.secure_cloud:
         payload["supportPublicIp"] = True
+    return payload
+
+
+def create_pod(args: argparse.Namespace, secrets: list[str], api_key: str, public_key: str) -> None:
+    payload = pod_payload(args, public_key)
     run(
         [
             "curl",
@@ -381,6 +390,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ssh-wait-seconds", type=int, default=180)
     parser.add_argument("--max-runtime-minutes", type=int, default=420)
     parser.add_argument("--allow-existing-pods", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--keep-pod", action="store_true")
     parser.add_argument("--keep-pod-on-failure", action="store_true")
     parser.add_argument("--sync", action="append", default=[])
@@ -398,11 +408,61 @@ def find_created(before: list[dict[str, str]], after: list[dict[str, str]], name
     return created[0]
 
 
+def sync_sources(args: argparse.Namespace) -> list[str]:
+    return [source for source in [*DEFAULT_SYNC, *args.sync] if (args.repo_root / source).exists()]
+
+
+def print_dry_run_plan(args: argparse.Namespace, secrets: list[str], public_key: str) -> None:
+    connection = Connection(host="dry-run.runpod.local", port=22)
+    print("dry-run: no RunPod API calls, SSH connections, rsync, or remote commands will run")
+    print("pod payload:")
+    print(redact(json.dumps(pod_payload(args, public_key), indent=2, sort_keys=True), secrets))
+    print("sync sources:")
+    for source in sync_sources(args):
+        print(f"- {source}")
+    print("commands:")
+    dry_run([args.runpodctl, "pod", "list", "-o", "json"], secrets=secrets)
+    dry_run(["curl", "--request", "POST", "--url", "https://rest.runpod.io/v1/pods", "--data", json.dumps(pod_payload(args, public_key), separators=(",", ":"))], secrets=secrets)
+    dry_run(ssh(args, connection, f"mkdir -p {quote(args.remote_dir)}"), secrets=secrets)
+    dry_run(
+        [
+            "rsync",
+            "-az",
+            "--relative",
+            "--timeout",
+            "30",
+            "-e",
+            rsync_ssh(args, connection),
+            *[f"./{source}" for source in sync_sources(args)],
+            f"{connection.user}@{connection.host}:{args.remote_dir}/",
+        ],
+        secrets=secrets,
+    )
+    dry_run(ssh(args, connection, remote_dir_command(args, args.setup_command)), secrets=secrets)
+    for command in args.remote:
+        dry_run(ssh(args, connection, remote_dir_command(args, split_remote(command))), secrets=secrets)
+    for output in args.output:
+        dry_run(
+            [
+                "rsync",
+                "-az",
+                "--timeout",
+                "30",
+                "-e",
+                rsync_ssh(args, connection),
+                f"{connection.user}@{connection.host}:{args.remote_dir}/{output.rstrip('/')}/",
+                str(args.repo_root / output),
+            ],
+            secrets=secrets,
+        )
+    dry_run([args.runpodctl, "pod", "delete", "dry-run-pod"], secrets=secrets)
+
+
 def main() -> int:
     args = parse_args()
     args.repo_root = args.repo_root.resolve()
     args.pod_name = args.pod_name or timestamped_name(args.name)
-    if shutil.which(args.runpodctl) is None:
+    if not args.dry_run and shutil.which(args.runpodctl) is None:
         raise FileNotFoundError(f"runpodctl command not found: {args.runpodctl}")
     if shutil.which("rsync") is None:
         raise FileNotFoundError("rsync command not found")
@@ -410,22 +470,31 @@ def main() -> int:
         raise FileNotFoundError("ssh command not found")
     if shutil.which("curl") is None:
         raise FileNotFoundError("curl command not found")
+    if args.dry_run and args.ssh_key is None:
+        args.ssh_key = Path("dry-run-ssh-key")
+    if args.dry_run and args.ssh_public_key is None:
+        args.ssh_public_key = Path("dry-run-ssh-key.pub")
     if args.ssh_key is None:
         raise ValueError("set RUNPOD_SSH_KEY or pass --ssh-key")
     if args.ssh_public_key is None:
         raise ValueError("set RUNPOD_SSH_PUBLIC_KEY or pass --ssh-public-key")
-    if not args.ssh_key.exists():
+    if not args.dry_run and not args.ssh_key.exists():
         raise FileNotFoundError(args.ssh_key)
-    if not args.ssh_public_key.exists():
+    if not args.dry_run and not args.ssh_public_key.exists():
         raise FileNotFoundError(args.ssh_public_key)
 
     api_key = os.environ.get("RUNPOD_API_KEY", "")
-    if not api_key:
+    if not api_key and not args.dry_run:
         if args.secret_path is None:
             raise ValueError("set RUNPOD_API_KEY, set RUNPOD_API_KEY_FILE, or pass --secret-path")
         api_key = load_text(args.secret_path)
-    public_key = load_text(args.ssh_public_key)
+    public_key = load_text(args.ssh_public_key) if args.ssh_public_key.exists() else ""
     secrets = [api_key, public_key]
+    if args.dry_run:
+        if not sync_sources(args):
+            raise RuntimeError("no sync sources found")
+        print_dry_run_plan(args, secrets, public_key)
+        return 0
     pod_id: str | None = None
     success = False
     try:

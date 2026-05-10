@@ -39,3 +39,7 @@ runpod-torch-v280
 
 The runner deletes the created pod after success or failure unless
 `--keep-pod` or `--keep-pod-on-failure` is set.
+
+Use `--dry-run` before paid jobs to print the pod payload, sync plan, remote
+commands, output copy commands, and cleanup command without requiring a RunPod
+API key or creating a pod.
