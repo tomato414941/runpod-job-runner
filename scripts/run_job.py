@@ -55,7 +55,7 @@ class TimingRecorder:
             result = callback()
             record["status"] = "passed"
             return result
-        except Exception:
+        except BaseException:
             record["status"] = "failed"
             raise
         finally:
