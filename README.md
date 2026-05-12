@@ -31,6 +31,10 @@ python3 scripts/run_job.py \
   --output runs/example
 ```
 
+`--output` values are `--repo-root` relative paths. Absolute paths and paths
+containing `..` are rejected because the same value is used for both the remote
+path under `$REMOTE_DIR` and the local copy destination.
+
 By default the runner uses the official RunPod PyTorch 2.8 template:
 
 ```text

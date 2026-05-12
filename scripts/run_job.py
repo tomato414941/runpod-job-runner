@@ -462,6 +462,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def validate_relative_path(value: str, *, option: str) -> None:
+    path = Path(value)
+    if path.is_absolute():
+        raise ValueError(f"{option} must be relative to --repo-root: {value}")
+    if not value.strip() or any(part == ".." for part in path.parts):
+        raise ValueError(f"{option} must stay within --repo-root: {value}")
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    for output in args.output:
+        validate_relative_path(output, option="--output")
+
+
 def find_created(before: list[dict[str, str]], after: list[dict[str, str]], name: str) -> dict[str, str]:
     before_ids = {pod["id"] for pod in before}
     created = [pod for pod in after if pod["id"] not in before_ids and pod["name"] == name]
@@ -531,6 +544,11 @@ def print_dry_run_plan(args: argparse.Namespace, secrets: list[str], public_key:
 def main() -> int:
     args = parse_args()
     args.repo_root = args.repo_root.resolve()
+    try:
+        validate_args(args)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     if args.timings_output is not None and not args.timings_output.is_absolute():
         args.timings_output = args.repo_root / args.timings_output
     args.pod_name = args.pod_name or timestamped_name(args.name)
