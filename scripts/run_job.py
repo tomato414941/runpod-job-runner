@@ -214,6 +214,8 @@ def pod_payload(args: argparse.Namespace, public_key: str) -> dict[str, object]:
         raise ValueError("set --template-id or --image")
     if args.allowed_cuda_version:
         payload["allowedCudaVersions"] = args.allowed_cuda_version
+    if args.min_vcpu_per_gpu is not None:
+        payload["minVCPUPerGPU"] = args.min_vcpu_per_gpu
     if args.data_center_ids:
         payload["dataCenterIds"] = [item.strip() for item in args.data_center_ids.split(",") if item.strip()]
     if public_key:
@@ -440,6 +442,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allowed-cuda-version", action="append")
     parser.add_argument("--gpu-type", default="NVIDIA GeForce RTX 4090")
     parser.add_argument("--gpu-count", type=int, default=1)
+    parser.add_argument("--min-vcpu-per-gpu", type=int)
     parser.add_argument("--secure-cloud", action="store_true")
     parser.add_argument("--container-disk-size", type=int, default=20)
     parser.add_argument("--volume-size", type=int, default=20)
