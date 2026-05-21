@@ -198,8 +198,7 @@ def active_pods(args: argparse.Namespace, secrets: list[str]) -> list[dict[str, 
 def pod_payload(args: argparse.Namespace, public_key: str) -> dict[str, object]:
     payload: dict[str, object] = {
         "name": args.pod_name,
-        "gpuTypeIds": [args.gpu_type],
-        "gpuCount": args.gpu_count,
+        "computeType": args.compute_type,
         "containerDiskInGb": args.container_disk_size,
         "volumeInGb": args.volume_size,
         "volumeMountPath": args.remote_volume,
@@ -212,10 +211,20 @@ def pod_payload(args: argparse.Namespace, public_key: str) -> dict[str, object]:
         payload["templateId"] = args.template_id
     else:
         raise ValueError("set --template-id or --image")
-    if args.allowed_cuda_version:
-        payload["allowedCudaVersions"] = args.allowed_cuda_version
-    if args.min_vcpu_per_gpu is not None:
-        payload["minVCPUPerGPU"] = args.min_vcpu_per_gpu
+    if args.compute_type == "GPU":
+        payload["gpuTypeIds"] = [args.gpu_type]
+        payload["gpuCount"] = args.gpu_count
+        if args.allowed_cuda_version:
+            payload["allowedCudaVersions"] = args.allowed_cuda_version
+        if args.min_vcpu_per_gpu is not None:
+            payload["minVCPUPerGPU"] = args.min_vcpu_per_gpu
+    elif args.compute_type == "CPU":
+        if args.cpu_flavor_id:
+            payload["cpuFlavorIds"] = args.cpu_flavor_id
+        payload["cpuFlavorPriority"] = args.cpu_flavor_priority
+        payload["vcpuCount"] = args.vcpu_count
+    else:
+        raise ValueError(f"unsupported compute type: {args.compute_type}")
     if args.data_center_ids:
         payload["dataCenterIds"] = [item.strip() for item in args.data_center_ids.split(",") if item.strip()]
     if public_key:
@@ -440,9 +449,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--template-id", default=DEFAULT_TEMPLATE_ID)
     parser.add_argument("--image")
     parser.add_argument("--allowed-cuda-version", action="append")
+    parser.add_argument("--compute-type", choices=("GPU", "CPU"), default="GPU")
     parser.add_argument("--gpu-type", default="NVIDIA GeForce RTX 4090")
     parser.add_argument("--gpu-count", type=int, default=1)
     parser.add_argument("--min-vcpu-per-gpu", type=int)
+    parser.add_argument("--cpu-flavor-id", action="append", default=[])
+    parser.add_argument("--cpu-flavor-priority", choices=("availability", "custom"), default="availability")
+    parser.add_argument("--vcpu-count", type=int, default=16)
     parser.add_argument("--secure-cloud", action="store_true")
     parser.add_argument("--container-disk-size", type=int, default=20)
     parser.add_argument("--volume-size", type=int, default=20)
@@ -541,7 +554,8 @@ def print_dry_run_plan(args: argparse.Namespace, secrets: list[str], public_key:
             ],
             secrets=secrets,
         )
-    dry_run([args.runpodctl, "pod", "delete", "dry-run-pod"], secrets=secrets)
+    if not args.keep_pod:
+        dry_run([args.runpodctl, "pod", "delete", "dry-run-pod"], secrets=secrets)
 
 
 def main() -> int:
