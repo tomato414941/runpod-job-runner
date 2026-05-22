@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import time
+import base64
 
 
 DEFAULT_TEMPLATE_ID = "runpod-torch-v280"
@@ -121,6 +122,36 @@ def run(
     if capture and completed.stderr:
         print(redact(completed.stderr, secrets), end="", file=sys.stderr)
     if check and completed.returncode != 0:
+        raise RuntimeError(f"command failed with exit code {completed.returncode}")
+    return completed
+
+
+def run_capture(
+    command: list[str],
+    *,
+    cwd: Path,
+    secrets: list[str],
+    env: dict[str, str] | None = None,
+    check: bool = True,
+    timeout: float | None = None,
+    print_command: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    if print_command:
+        print(f"$ {redact(command_text(command), secrets)}")
+    completed = subprocess.run(
+        command,
+        cwd=cwd,
+        env=os.environ | (env or {}),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=timeout,
+    )
+    if check and completed.returncode != 0:
+        if completed.stdout:
+            print(redact(completed.stdout, secrets), end="")
+        if completed.stderr:
+            print(redact(completed.stderr, secrets), end="", file=sys.stderr)
         raise RuntimeError(f"command failed with exit code {completed.returncode}")
     return completed
 
@@ -415,6 +446,153 @@ def split_remote(command: str) -> str:
     return command
 
 
+def detached_state_dir(remote_dir: str, index: int) -> str:
+    return f"{remote_dir.rstrip('/')}/.runpod-job-runner/remote-{index:03d}"
+
+
+def install_detached_remote_script(
+    args: argparse.Namespace,
+    connection: Connection,
+    secrets: list[str],
+    *,
+    index: int,
+    command: str,
+) -> None:
+    state_dir = detached_state_dir(args.remote_dir, index)
+    script_text = f"#!/usr/bin/env bash\nREMOTE_DIR={quote(args.remote_dir)}\n{split_remote(command)}\n"
+    encoded = base64.b64encode(script_text.encode("utf-8")).decode("ascii")
+    remote_command = "\n".join(
+        [
+            "set -euo pipefail",
+            f"mkdir -p {quote(state_dir)}",
+            "python3 - <<'PY'",
+            "from pathlib import Path",
+            "import base64",
+            f"path = Path({state_dir!r}) / 'command.sh'",
+            f"path.write_bytes(base64.b64decode({encoded!r}))",
+            "path.chmod(0o755)",
+            "PY",
+            f"rm -f {quote(state_dir + '/exit_code')} {quote(state_dir + '/pid')} {quote(state_dir + '/job.log')}",
+        ]
+    )
+    run(ssh(args, connection, remote_command), cwd=args.repo_root, secrets=secrets)
+
+
+def start_detached_remote(
+    args: argparse.Namespace,
+    connection: Connection,
+    secrets: list[str],
+    *,
+    index: int,
+) -> None:
+    state_dir = detached_state_dir(args.remote_dir, index)
+    remote_command = " ".join(
+        [
+            "set -euo pipefail;",
+            f"state_dir={quote(state_dir)};",
+            'nohup bash -c \'set +e; bash "$0/command.sh"; code=$?; printf "%s\\n" "$code" > "$0/exit_code"; exit "$code"\' "$state_dir"',
+            '> "$state_dir/job.log" 2>&1 < /dev/null &',
+            'printf "%s\\n" "$!" > "$state_dir/pid"',
+        ]
+    )
+    run(ssh(args, connection, remote_command), cwd=args.repo_root, secrets=secrets)
+
+
+@dataclass(frozen=True)
+class DetachedRemoteStatus:
+    output: str
+    log_size: int
+    exit_code: int | None
+    running: bool
+
+
+def poll_detached_remote(
+    args: argparse.Namespace,
+    connection: Connection,
+    secrets: list[str],
+    *,
+    index: int,
+    log_offset: int,
+) -> DetachedRemoteStatus | None:
+    state_dir = detached_state_dir(args.remote_dir, index)
+    remote_command = "\n".join(
+        [
+            "set +e",
+            f"state_dir={quote(state_dir)}",
+            'log="$state_dir/job.log"',
+            'exit_code_file="$state_dir/exit_code"',
+            'pid_file="$state_dir/pid"',
+            f"offset={log_offset}",
+            'size=0',
+            'if [ -f "$log" ]; then',
+            '  size=$(wc -c < "$log" | tr -d " ")',
+            '  if [ "$size" -gt "$offset" ]; then',
+            '    tail -c +"$((offset + 1))" "$log"',
+            '  fi',
+            'fi',
+            'printf "\\n__RUNPOD_DETACHED_LOG_SIZE__=%s\\n" "$size"',
+            'if [ -f "$exit_code_file" ]; then',
+            '  code=$(cat "$exit_code_file")',
+            '  printf "__RUNPOD_DETACHED_EXIT_CODE__=%s\\n" "$code"',
+            '  exit 0',
+            'fi',
+            'if [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then',
+            '  printf "__RUNPOD_DETACHED_RUNNING__=1\\n"',
+            '  exit 0',
+            'fi',
+            'printf "__RUNPOD_DETACHED_EXIT_CODE__=255\\n"',
+        ]
+    )
+    completed = run_capture(
+        ssh(args, connection, remote_command),
+        cwd=args.repo_root,
+        secrets=secrets,
+        check=False,
+        print_command=False,
+    )
+    if completed.returncode != 0:
+        message = completed.stderr.strip() or completed.stdout.strip() or f"ssh exited {completed.returncode}"
+        print(f"detached remote poll failed: {redact(message, secrets)}", file=sys.stderr)
+        return None
+    text = completed.stdout
+    size_match = re.search(r"^__RUNPOD_DETACHED_LOG_SIZE__=(\d+)$", text, flags=re.MULTILINE)
+    exit_match = re.search(r"^__RUNPOD_DETACHED_EXIT_CODE__=(\d+)$", text, flags=re.MULTILINE)
+    running = re.search(r"^__RUNPOD_DETACHED_RUNNING__=1$", text, flags=re.MULTILINE) is not None
+    output = re.sub(r"^__RUNPOD_DETACHED_(?:LOG_SIZE|EXIT_CODE|RUNNING)__=.*\n?", "", text, flags=re.MULTILINE)
+    if output:
+        print(redact(output, secrets), end="" if output.endswith("\n") else "\n")
+    log_size = int(size_match.group(1)) if size_match else log_offset
+    exit_code = int(exit_match.group(1)) if exit_match else None
+    return DetachedRemoteStatus(output=output, log_size=log_size, exit_code=exit_code, running=running)
+
+
+def run_detached_remote(
+    args: argparse.Namespace,
+    connection: Connection,
+    secrets: list[str],
+    *,
+    index: int,
+    command: str,
+    deadline: float | None,
+) -> None:
+    install_detached_remote_script(args, connection, secrets, index=index, command=command)
+    start_detached_remote(args, connection, secrets, index=index)
+    log_offset = 0
+    while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError(f"detached remote command exceeded max runtime: remote_{index}")
+        status = poll_detached_remote(args, connection, secrets, index=index, log_offset=log_offset)
+        if status is None:
+            time.sleep(args.remote_poll_seconds)
+            continue
+        log_offset = max(log_offset, status.log_size)
+        if status.exit_code is not None:
+            if status.exit_code != 0:
+                raise RuntimeError(f"detached remote command failed with exit code {status.exit_code}")
+            return
+        time.sleep(args.remote_poll_seconds)
+
+
 def local_shell_command(command: str) -> list[str]:
     if not command.strip():
         raise ValueError("local command must not be empty")
@@ -474,6 +652,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sync", action="append", default=[])
     parser.add_argument("--setup-command", required=True)
     parser.add_argument("--remote", action="append", default=[])
+    parser.add_argument("--detached-remote", action="store_true")
+    parser.add_argument("--remote-poll-seconds", type=int, default=30)
     parser.add_argument("--output", action="append", required=True)
     return parser.parse_args()
 
@@ -537,7 +717,13 @@ def print_dry_run_plan(args: argparse.Namespace, secrets: list[str], public_key:
     )
     dry_run(ssh(args, connection, remote_dir_command(args, args.setup_command)), secrets=secrets)
     for command in args.remote:
-        dry_run(ssh(args, connection, remote_dir_command(args, split_remote(command))), secrets=secrets)
+        if args.detached_remote:
+            print("dry-run detached remote command:")
+            dry_run(ssh(args, connection, "install detached remote script"), secrets=secrets)
+            dry_run(ssh(args, connection, "start detached remote script"), secrets=secrets)
+            dry_run(ssh(args, connection, "poll detached remote status until exit"), secrets=secrets)
+        else:
+            dry_run(ssh(args, connection, remote_dir_command(args, split_remote(command))), secrets=secrets)
     for output in args.output:
         dry_run(
             [
@@ -653,15 +839,28 @@ def main() -> int:
         deadline = time.monotonic() + args.max_runtime_minutes * 60 if args.max_runtime_minutes > 0 else None
         for index, command in enumerate(args.remote, start=1):
             timeout = None if deadline is None else max(1, deadline - time.monotonic())
-            timings.step(
-                f"remote_{index}",
-                lambda command=command, timeout=timeout: run(
-                    ssh(args, connection, remote_dir_command(args, split_remote(command))),
-                    cwd=args.repo_root,
-                    secrets=secrets,
-                    timeout=timeout,
-                ),
-            )
+            if args.detached_remote:
+                timings.step(
+                    f"remote_{index}",
+                    lambda command=command: run_detached_remote(
+                        args,
+                        connection,
+                        secrets,
+                        index=index,
+                        command=command,
+                        deadline=deadline,
+                    ),
+                )
+            else:
+                timings.step(
+                    f"remote_{index}",
+                    lambda command=command, timeout=timeout: run(
+                        ssh(args, connection, remote_dir_command(args, split_remote(command))),
+                        cwd=args.repo_root,
+                        secrets=secrets,
+                        timeout=timeout,
+                    ),
+                )
         timings.step("output_sync", lambda: rsync_from_remote(args, connection, secrets))
         success = True
         status = "passed"
