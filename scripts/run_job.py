@@ -560,7 +560,7 @@ def poll_detached_remote(
     running = re.search(r"^__RUNPOD_DETACHED_RUNNING__=1$", text, flags=re.MULTILINE) is not None
     output = re.sub(r"^__RUNPOD_DETACHED_(?:LOG_SIZE|EXIT_CODE|RUNNING)__=.*\n?", "", text, flags=re.MULTILINE)
     if output:
-        print(redact(output, secrets), end="" if output.endswith("\n") else "\n")
+        print(redact(output, secrets), end="" if output.endswith("\n") else "\n", flush=True)
     log_size = int(size_match.group(1)) if size_match else log_offset
     exit_code = int(exit_match.group(1)) if exit_match else None
     return DetachedRemoteStatus(output=output, log_size=log_size, exit_code=exit_code, running=running)
