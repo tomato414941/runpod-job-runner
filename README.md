@@ -55,3 +55,10 @@ compute. In `--dry-run` mode, local commands are printed but not executed.
 Use `--timings-output path/to/timings.json` to write job step timings for later
 inspection. The timings file records step names, timestamps, durations, and
 status without storing command text or secrets.
+
+The runner records resource samples by default while remote commands run. It
+writes `resource_samples.jsonl` and `resource_summary.json` under the first
+`--output` directory. The monitor records CPU utilization, RAM use, and GPU
+utilization, GPU memory, and GPU power when `nvidia-smi` is available. Use
+`--disable-resource-monitor` only when resource sampling is intentionally not
+wanted.

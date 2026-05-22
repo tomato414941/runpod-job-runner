@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import base64
+import textwrap
 
 
 DEFAULT_TEMPLATE_ID = "runpod-torch-v280"
@@ -436,6 +437,10 @@ def rsync_from_remote(args: argparse.Namespace, connection: Connection, secrets:
         )
 
 
+def primary_output(args: argparse.Namespace) -> str:
+    return str(args.output[0]).rstrip("/")
+
+
 def remote_dir_command(args: argparse.Namespace, command: str) -> str:
     return f"REMOTE_DIR={quote(args.remote_dir)}; {command}"
 
@@ -496,6 +501,206 @@ def start_detached_remote(
         ]
     )
     run(ssh(args, connection, remote_command), cwd=args.repo_root, secrets=secrets)
+
+
+def install_resource_monitor(
+    args: argparse.Namespace,
+    connection: Connection,
+    secrets: list[str],
+) -> None:
+    script_text = r'''
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import signal
+import subprocess
+import time
+
+
+running = True
+
+
+def stop(_signum: int, _frame: object) -> None:
+    global running
+    running = False
+
+
+def utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def cpu_totals() -> tuple[int, int] | None:
+    try:
+        parts = Path('/proc/stat').read_text(encoding='utf-8').splitlines()[0].split()[1:]
+    except Exception:
+        return None
+    values = [int(part) for part in parts]
+    idle = values[3] + values[4]
+    return sum(values), idle
+
+
+def memory_sample() -> dict[str, float | None]:
+    try:
+        values: dict[str, int] = {}
+        for line in Path('/proc/meminfo').read_text(encoding='utf-8').splitlines():
+            key, value = line.split(':', 1)
+            values[key] = int(value.strip().split()[0])
+    except Exception:
+        return {'ram_used_mib': None, 'ram_total_mib': None}
+    total = values.get('MemTotal')
+    available = values.get('MemAvailable')
+    if total is None or available is None:
+        return {'ram_used_mib': None, 'ram_total_mib': None}
+    return {'ram_used_mib': float((total - available) / 1024), 'ram_total_mib': float(total / 1024)}
+
+
+def gpu_sample() -> dict[str, float | None]:
+    command = [
+        'nvidia-smi',
+        '--query-gpu=utilization.gpu,memory.used,memory.total,power.draw',
+        '--format=csv,noheader,nounits',
+    ]
+    try:
+        output = subprocess.check_output(command, text=True, stderr=subprocess.DEVNULL).strip().splitlines()[0]
+        gpu_util, memory_used, memory_total, power_draw = [float(part.strip()) for part in output.split(',')]
+    except Exception:
+        return {
+            'gpu_util_percent': None,
+            'gpu_memory_used_mib': None,
+            'gpu_memory_total_mib': None,
+            'gpu_power_draw_w': None,
+        }
+    return {
+        'gpu_util_percent': gpu_util,
+        'gpu_memory_used_mib': memory_used,
+        'gpu_memory_total_mib': memory_total,
+        'gpu_power_draw_w': power_draw,
+    }
+
+
+def summarize(samples: list[dict[str, object]]) -> dict[str, object]:
+    summary: dict[str, object] = {
+        'sample_count': len(samples),
+        'started_at': samples[0]['timestamp'] if samples else None,
+        'finished_at': samples[-1]['timestamp'] if samples else None,
+    }
+    numeric_keys = [
+        'cpu_util_percent',
+        'ram_used_mib',
+        'ram_total_mib',
+        'gpu_util_percent',
+        'gpu_memory_used_mib',
+        'gpu_memory_total_mib',
+        'gpu_power_draw_w',
+    ]
+    for key in numeric_keys:
+        values = [float(sample[key]) for sample in samples if isinstance(sample.get(key), int | float)]
+        summary[f'{key}_avg'] = sum(values) / len(values) if values else None
+        summary[f'{key}_max'] = max(values) if values else None
+    return summary
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--samples', required=True)
+    parser.add_argument('--summary', required=True)
+    parser.add_argument('--interval-seconds', type=float, default=1.0)
+    args = parser.parse_args()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    samples_path = Path(args.samples)
+    summary_path = Path(args.summary)
+    samples_path.parent.mkdir(parents=True, exist_ok=True)
+    samples: list[dict[str, object]] = []
+    previous_cpu = cpu_totals()
+    with samples_path.open('a', encoding='utf-8') as file:
+        while running:
+            time.sleep(max(args.interval_seconds, 0.1))
+            current_cpu = cpu_totals()
+            cpu_util = None
+            if previous_cpu is not None and current_cpu is not None:
+                total_delta = current_cpu[0] - previous_cpu[0]
+                idle_delta = current_cpu[1] - previous_cpu[1]
+                if total_delta > 0:
+                    cpu_util = 100.0 * (1.0 - idle_delta / total_delta)
+            previous_cpu = current_cpu
+            sample: dict[str, object] = {'timestamp': utc_timestamp(), 'cpu_util_percent': cpu_util}
+            sample.update(memory_sample())
+            sample.update(gpu_sample())
+            samples.append(sample)
+            file.write(json.dumps(sample, sort_keys=True) + '\n')
+            file.flush()
+    summary_path.write_text(json.dumps(summarize(samples), indent=2, sort_keys=True) + '\n', encoding='utf-8')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+'''
+    state_dir = f"{args.remote_dir.rstrip('/')}/.runpod-job-runner"
+    encoded = base64.b64encode(textwrap.dedent(script_text).encode("utf-8")).decode("ascii")
+    remote_command = "\n".join(
+        [
+            "set -euo pipefail",
+            f"mkdir -p {quote(state_dir)}",
+            "python3 - <<'PY'",
+            "from pathlib import Path",
+            "import base64",
+            f"path = Path({state_dir!r}) / 'resource_monitor.py'",
+            f"path.write_bytes(base64.b64decode({encoded!r}))",
+            "path.chmod(0o755)",
+            "PY",
+        ]
+    )
+    run(ssh(args, connection, remote_command), cwd=args.repo_root, secrets=secrets)
+
+
+def start_resource_monitor(args: argparse.Namespace, connection: Connection, secrets: list[str]) -> None:
+    output = primary_output(args)
+    state_dir = f"{args.remote_dir.rstrip('/')}/.runpod-job-runner"
+    output_dir = f"{args.remote_dir.rstrip('/')}/{output}"
+    samples_path = f"{output_dir}/resource_samples.jsonl"
+    summary_path = f"{output_dir}/resource_summary.json"
+    remote_command = " ".join(
+        [
+            "set -euo pipefail;",
+            f"mkdir -p {quote(output_dir)};",
+            f"state_dir={quote(state_dir)};",
+            f"python3 {quote(state_dir + '/resource_monitor.py')}",
+            f"--samples {quote(samples_path)}",
+            f"--summary {quote(summary_path)}",
+            f"--interval-seconds {quote(str(args.resource_monitor_interval_seconds))}",
+            '> "$state_dir/resource_monitor.log" 2>&1 < /dev/null &',
+            'printf "%s\\n" "$!" > "$state_dir/resource_monitor.pid"',
+        ]
+    )
+    run(ssh(args, connection, remote_command), cwd=args.repo_root, secrets=secrets)
+
+
+def stop_resource_monitor(args: argparse.Namespace, connection: Connection, secrets: list[str]) -> None:
+    state_dir = f"{args.remote_dir.rstrip('/')}/.runpod-job-runner"
+    remote_command = "\n".join(
+        [
+            "set +e",
+            f"state_dir={quote(state_dir)}",
+            'pid_file="$state_dir/resource_monitor.pid"',
+            'if [ ! -f "$pid_file" ]; then exit 0; fi',
+            'pid=$(cat "$pid_file")',
+            'kill "$pid" >/dev/null 2>&1 || true',
+            'for _ in $(seq 1 20); do',
+            '  kill -0 "$pid" >/dev/null 2>&1 || exit 0',
+            '  sleep 0.25',
+            'done',
+            'kill -9 "$pid" >/dev/null 2>&1 || true',
+            "exit 0",
+        ]
+    )
+    run(ssh(args, connection, remote_command), cwd=args.repo_root, secrets=secrets, check=False)
 
 
 @dataclass(frozen=True)
@@ -654,6 +859,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--remote", action="append", default=[])
     parser.add_argument("--detached-remote", action="store_true")
     parser.add_argument("--remote-poll-seconds", type=int, default=30)
+    parser.add_argument("--disable-resource-monitor", action="store_true")
+    parser.add_argument("--resource-monitor-interval-seconds", type=float, default=1.0)
     parser.add_argument("--output", action="append", required=True)
     return parser.parse_args()
 
@@ -716,6 +923,10 @@ def print_dry_run_plan(args: argparse.Namespace, secrets: list[str], public_key:
         secrets=secrets,
     )
     dry_run(ssh(args, connection, remote_dir_command(args, args.setup_command)), secrets=secrets)
+    if not args.disable_resource_monitor:
+        print("resource monitor:")
+        dry_run(ssh(args, connection, "install resource monitor script"), secrets=secrets)
+        dry_run(ssh(args, connection, "start resource monitor"), secrets=secrets)
     for command in args.remote:
         if args.detached_remote:
             print("dry-run detached remote command:")
@@ -724,6 +935,8 @@ def print_dry_run_plan(args: argparse.Namespace, secrets: list[str], public_key:
             dry_run(ssh(args, connection, "poll detached remote status until exit"), secrets=secrets)
         else:
             dry_run(ssh(args, connection, remote_dir_command(args, split_remote(command))), secrets=secrets)
+    if not args.disable_resource_monitor:
+        dry_run(ssh(args, connection, "stop resource monitor"), secrets=secrets)
     for output in args.output:
         dry_run(
             [
@@ -758,6 +971,9 @@ def main() -> int:
     timings = TimingRecorder(args.timings_output, pod_name=args.pod_name, dry_run=args.dry_run)
     status = "failed"
     pod_id: str | None = None
+    connection: Connection | None = None
+    resource_monitor_started = False
+    output_synced = False
     success = False
     try:
         if args.dry_run and args.ssh_key is None:
@@ -836,6 +1052,10 @@ def main() -> int:
             "setup",
             lambda: run(ssh(args, connection, remote_dir_command(args, args.setup_command)), cwd=args.repo_root, secrets=secrets),
         )
+        if not args.disable_resource_monitor:
+            timings.step("resource_monitor_install", lambda: install_resource_monitor(args, connection, secrets))
+            timings.step("resource_monitor_start", lambda: start_resource_monitor(args, connection, secrets))
+            resource_monitor_started = True
         deadline = time.monotonic() + args.max_runtime_minutes * 60 if args.max_runtime_minutes > 0 else None
         for index, command in enumerate(args.remote, start=1):
             timeout = None if deadline is None else max(1, deadline - time.monotonic())
@@ -861,11 +1081,25 @@ def main() -> int:
                         timeout=timeout,
                     ),
                 )
+        if resource_monitor_started:
+            timings.step("resource_monitor_stop", lambda: stop_resource_monitor(args, connection, secrets))
+            resource_monitor_started = False
         timings.step("output_sync", lambda: rsync_from_remote(args, connection, secrets))
+        output_synced = True
         success = True
         status = "passed"
         return 0
     finally:
+        if resource_monitor_started and connection is not None:
+            try:
+                timings.step("resource_monitor_stop", lambda: stop_resource_monitor(args, connection, secrets))
+            except Exception as exc:
+                print(f"resource monitor stop failed: {exc}", file=sys.stderr)
+        if pod_id and connection is not None and not output_synced and not args.dry_run:
+            try:
+                timings.step("output_sync_after_failure", lambda: rsync_from_remote(args, connection, secrets))
+            except Exception as exc:
+                print(f"output sync after failure failed: {exc}", file=sys.stderr)
         if pod_id and not args.keep_pod and (success or not args.keep_pod_on_failure):
             timings.step(
                 "pod_delete",
