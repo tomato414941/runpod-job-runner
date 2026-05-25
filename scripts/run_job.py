@@ -232,11 +232,14 @@ def pod_payload(args: argparse.Namespace, public_key: str) -> dict[str, object]:
         "name": args.pod_name,
         "computeType": args.compute_type,
         "containerDiskInGb": args.container_disk_size,
-        "volumeInGb": args.volume_size,
         "volumeMountPath": args.remote_volume,
         "ports": ["22/tcp"],
         "cloudType": "SECURE" if args.secure_cloud else "COMMUNITY",
     }
+    if args.network_volume_id:
+        payload["networkVolumeId"] = args.network_volume_id
+    else:
+        payload["volumeInGb"] = args.volume_size
     if args.image:
         payload["imageName"] = args.image
     elif args.template_id:
@@ -842,6 +845,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--secure-cloud", action="store_true")
     parser.add_argument("--container-disk-size", type=int, default=20)
     parser.add_argument("--volume-size", type=int, default=20)
+    parser.add_argument("--network-volume-id")
     parser.add_argument("--remote-volume", default="/workspace")
     parser.add_argument("--remote-dir", default=DEFAULT_REMOTE_DIR)
     parser.add_argument("--data-center-ids", default="")
@@ -876,6 +880,8 @@ def validate_relative_path(value: str, *, option: str) -> None:
 def validate_args(args: argparse.Namespace) -> None:
     for output in args.output:
         validate_relative_path(output, option="--output")
+    if args.network_volume_id and not args.secure_cloud:
+        raise ValueError("--network-volume-id requires --secure-cloud")
 
 
 def find_created(before: list[dict[str, str]], after: list[dict[str, str]], name: str) -> dict[str, str]:
